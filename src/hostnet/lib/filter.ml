@@ -51,17 +51,15 @@ module Make(Input: Sig.VMNET) = struct
             Log.warn (fun f -> f "dropping unexpected UDP packet sent from %s:%d to %s:%d (valid sources = %s)"
               src src_port dst dst_port (String.concat ", " (List.map Ipaddr.V4.to_string valid_sources)))
           | Some `TCP ->
-            let src_port = Wire_structs.Tcp_wire.get_tcp_src_port body in
-            let dst_port = Wire_structs.Tcp_wire.get_tcp_dst_port body in
-            Log.warn (fun f -> f "dropping unexpected TCP packet sent from %s:%d to %s:%d (valid sources = %s)"
-              src src_port dst dst_port (String.concat ", " (List.map Ipaddr.V4.to_string valid_sources)))
-          | _ ->
-            Log.warn (fun f -> f "dropping unknown IP protocol %d sent from %s to %s (valid sources = %s)"
-              (Wire_structs.Ipv4_wire.get_ipv4_proto payload) src dst  (String.concat ", " (List.map Ipaddr.V4.to_string valid_sources)))
-        end;
-        Lwt.return ()
-      end
-    | _ -> next buf
+            let open Tcp.Tcp_packet in
+            Unmarshal.of_cstruct ipv4_payload >>= fun (header, _) ->
+            warn_drop ipv4_header header.src_port header.dst_port valid_sources
+          | Some `ICMP | None -> warn_drop_simple ipv4_header valid_sources
+        end
+    in
+    match check buf with
+    | Result.Ok () -> next buf
+    | Result.Error _ -> Lwt.return_unit
 
   let listen t callback = Input.listen t.input @@ filter t.valid_sources callback
   let add_listener t callback = Input.add_listener t.input @@ filter t.valid_sources callback

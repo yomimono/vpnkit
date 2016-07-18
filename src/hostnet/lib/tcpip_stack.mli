@@ -11,5 +11,6 @@ val connect:
   -> [ `Ok of t | `Error of [ `Msg of string ] ] Lwt.t
 
 val icmpv4 : t -> ICMPV4.t
+val arpv4 : t -> ARPV4.t
 
 end

@@ -38,168 +38,6 @@ let print_pcap = function
   | Some (file, None) -> "capturing to " ^ file ^ " with no limit"
   | Some (file, Some limit) -> "capturing to " ^ file ^ " but limited to " ^ (Int64.to_string limit)
 
-<<<<<<< HEAD
-module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_CONF)(Host: Sig.HOST) = struct
-  module Tcpip_stack = Tcpip_stack.Make(Vmnet)(Host.Time)
-  module Dns_forward = Dns_forward.Make(Tcpip_stack.IPV4)(Tcpip_stack.UDPV4)(Resolv_conf)(Host.Sockets)(Host.Time)
-
-module Socket = Host.Sockets
-
-type stack = {
-  after_disconnect: unit Lwt.t;
-}
-
-let after_disconnect t = t.after_disconnect
-
-let connect x peer_ip local_ip =
-  let config = Tcpip_stack.make ~client_macaddr ~server_macaddr ~peer_ip ~local_ip in
-        begin Tcpip_stack.connect ~config x
-        >>= function
-        | `Error (`Msg m) -> failwith m
-        | `Ok s ->
-          let (ip, udp) = Tcpip_stack.ipv4 s, Tcpip_stack.udpv4 s in
-            Tcpip_stack.listen_udpv4 s ~port:53 (Dns_forward.input ~ip ~udp);
-            Vmnet.add_listener x (
-              fun buf ->
-                match (Wire_structs.parse_ethernet_frame buf) with
-                | Some (Some Wire_structs.IPv4, _, payload) ->
-                  let src = Ipaddr.V4.of_int32 @@ Wire_structs.Ipv4_wire.get_ipv4_src payload in
-                  let dst = Ipaddr.V4.of_int32 @@ Wire_structs.Ipv4_wire.get_ipv4_dst payload in
-                  begin match Wire_structs.Ipv4_wire.(int_to_protocol @@ get_ipv4_proto payload) with
-                    | Some `UDP ->
-                      let hlen_version = Wire_structs.Ipv4_wire.get_ipv4_hlen_version payload in
-                      let ihl = hlen_version land 0xf in
-                      let udp = Cstruct.shift payload (ihl * 4) in
-                      let src_port = Wire_structs.get_udp_source_port udp in
-                      let dst_port = Wire_structs.get_udp_dest_port udp in
-                      let length = Wire_structs.get_udp_length udp in
-                      let flags_fragment_offset = Wire_structs.Ipv4_wire.get_ipv4_off payload in
-                      let dnf = ((flags_fragment_offset lsr 8) land 0x40) <> 0 in
-                      if Cstruct.len udp < length then begin
-                        Log.err (fun f -> f "Dropping UDP %s:%d -> %s:%d reported len %d actual len %d"
-                                     (Ipaddr.V4.to_string src) src_port
-                                     (Ipaddr.V4.to_string dst) dst_port
-                                     length (Cstruct.len udp));
-                        Lwt.return_unit
-                      end else if dnf && (Cstruct.len payload > mtu) then begin
-                        let would_fragment ~ip_header ~ip_payload =
-                          let open Wire_structs.Ipv4_wire in
-                          let header = Cstruct.create sizeof_icmpv4 in
-                          set_icmpv4_ty header 0x03;
-                          set_icmpv4_code header 0x04;
-                          set_icmpv4_csum header 0x0000;
-                          (* this field is unused for icmp destination unreachable *)
-                          set_icmpv4_id header 0x00;
-                          set_icmpv4_seq header mtu;
-                          let icmp_payload = match ip_payload with
-                            | Some ip_payload ->
-                              if (Cstruct.len ip_payload > 8) then begin
-                                let ip_payload = Cstruct.sub ip_payload 0 8 in
-                                Cstruct.append ip_header ip_payload
-                              end else Cstruct.append ip_header ip_payload
-                            | None -> ip_header
-                          in
-                          set_icmpv4_csum header
-                            (Tcpip_checksum.ones_complement_list [ header;
-                                                                   icmp_payload ]);
-                          let icmp_packet = Cstruct.append header icmp_payload in
-                          icmp_packet
-                        in
-                        let ethernet_frame, len = Tcpip_stack.IPV4.allocate (Tcpip_stack.ipv4 s)
-                          ~src:dst ~dst:src ~proto:`ICMP in
-                        let ethernet_ip_hdr = Cstruct.sub ethernet_frame 0 len in
-
-                        let reply = would_fragment
-                            ~ip_header:(Cstruct.sub payload 0 (ihl * 4))
-                            ~ip_payload:(Some (Cstruct.sub payload (ihl * 4) 8)) in
-                        (* Rather than silently unset the do not fragment bit, we
-                           respond with an ICMP error message which will
-                           hopefully prompt the other side to send messages we
-                           can forward *)
-                        Log.err (fun f -> f
-                                    "Sending icmp-dst-unreachable in response to UDP %s:%d -> %s:%d with DNF set IPv4 len %d"
-                                     (Ipaddr.V4.to_string src) src_port
-                                     (Ipaddr.V4.to_string dst) dst_port
-                                     length);
-                        Tcpip_stack.IPV4.writev (Tcpip_stack.ipv4 s) ethernet_ip_hdr [ reply ];
-                      end else begin
-                        let payload = Cstruct.sub udp Wire_structs.sizeof_udp (length - Wire_structs.sizeof_udp) in
-                        let for_us = Ipaddr.V4.compare dst local_ip == 0 in
-                        (* We handle DNS on port 53 ourselves, see [listen_udpv4] above *)
-                        (* ... but if it's going to an external IP then we treat it like all other
-                           UDP and NAT it *)
-                        if (not for_us) then begin
-                          Log.debug (fun f -> f "UDP %s:%d -> %s:%d len %d"
-                                       (Ipaddr.V4.to_string src) src_port
-                                       (Ipaddr.V4.to_string dst) dst_port
-                                       length
-                                   );
-                          let reply buf = Tcpip_stack.UDPV4.writev ~source_ip:dst ~source_port:dst_port ~dest_ip:src ~dest_port:src_port (Tcpip_stack.udpv4 s) [ buf ] in
-                          Socket.Datagram.input ~reply ~src:(Ipaddr.V4 src, src_port) ~dst:(Ipaddr.V4 dst, dst_port) ~payload
-                        end
-                        else if for_us && dst_port == 123 then begin
-                          (* port 123 is special -- proxy these requests to
-                             our localhost address for the local OSX ntp
-                             listener to respond to *)
-                          let localhost = Ipaddr.V4.localhost in
-                          Log.debug (fun f -> f "UDP/123 request from port %d -- sending it to %a:%d" src_port Ipaddr.V4.pp_hum localhost dst_port);
-                          let reply buf = Tcpip_stack.UDPV4.writev ~source_ip:local_ip ~source_port:dst_port ~dest_ip:src ~dest_port:src_port (Tcpip_stack.udpv4 s) [ buf ] in
-                          Socket.Datagram.input ~reply ~src:(Ipaddr.V4 src, src_port) ~dst:(Ipaddr.V4 localhost, dst_port) ~payload
-                        end else Lwt.return_unit
-                      end
-                    | _ -> Lwt.return_unit
-                  end
-                | _ -> Lwt.return_unit
-            );
-            Tcpip_stack.listen_tcpv4_flow s ~on_flow_arrival:(
-              fun ~src:(src_ip, src_port) ~dst:(dst_ip, dst_port) ->
-
-                let for_us src_ip = Ipaddr.V4.compare src_ip local_ip == 0 in
-                ( if for_us src_ip && src_port = 53 then begin
-                    Resolv_conf.get () (* re-read /etc/resolv.conf *)
-                    >>= function
-                    | (Ipaddr.V4 ip, port) :: _  -> Lwt.return (ip, port)
-                    | _ ->
-                      Log.err (fun f -> f "Failed to discover DNS server: assuming 127.0.01");
-                      Lwt.return (Ipaddr.V4.of_string_exn "127.0.0.1", 53)
-                  end else Lwt.return (src_ip, src_port)
-                ) >>= fun (src_ip, src_port) ->
-                (* If the traffic is for us, use a local IP address that is really
-                   ours, rather than send traffic off to someone else (!) *)
-                let src_ip = if for_us src_ip then Ipaddr.V4.localhost else src_ip in
-                Socket.Stream.Tcp.connect (src_ip, src_port)
-                >>= function
-                | `Error (`Msg _) ->
-                  return `Reject
-                | `Ok remote ->
-                  Lwt.return (`Accept (fun local ->
-                      finally (fun () ->
-                          (* proxy between local and remote *)
-                          Mirage_flow.proxy (module Clock) (module Tcpip_stack.TCPV4_half_close) local (module Socket.Stream.Tcp) remote ()
-                          >>= function
-                          | `Error (`Msg m) ->
-                            Log.err (fun f ->
-                              let description =
-                                Printf.sprintf "TCP %s:%d > %s:%d"
-                                  (Ipaddr.V4.to_string src_ip) src_port
-                                  (Ipaddr.V4.to_string dst_ip) dst_port in
-                               f "%s proxy failed with %s" description m);
-                            return ()
-                          | `Ok (_l_stats, _r_stats) ->
-                            return ()
-                        ) (fun () ->
-                          Socket.Stream.Tcp.close remote
-                          >>= fun () ->
-                          Lwt.return ()
-                        )
-                    ))
-            );
-            Tcpip_stack.listen s
-            >>= fun () ->
-            Log.info (fun f -> f "TCP/IP ready");
-            Lwt.return { after_disconnect = Vmnet.after_disconnect x }
-        end
-=======
 type transport = | Tcp of (Tcp.Tcp_packet.t * Cstruct.t)
                  | Udp of (Udp_packet.t * Cstruct.t)
                  | Icmp of (Icmpv4_packet.t * Cstruct.t)
@@ -226,7 +64,8 @@ let decompose buf =
     | Some `UDP ->
       Udp_packet.Unmarshal.of_cstruct buf >>= fun udp -> Result.Ok (Some (Udp udp))
   in
-  Ethif_packet.Unmarshal.of_cstruct buf >>= fun (e, e_payload) ->
+  let open Ethif_packet in
+  Unmarshal.of_cstruct buf >>= fun (e, e_payload) ->
   match e.ethertype with
   | Ethif_wire.IPv6 ->
     let header = Cstruct.sub e_payload 0 Ipv6_wire.sizeof_ipv6 in
@@ -235,7 +74,8 @@ let decompose buf =
     Ok { ethernet = (e, e_payload) ; network = Ipv6 (header, payload);
          transport}
   | Ethif_wire.IPv4 ->
-    Ipv4_packet.Unmarshal.of_cstruct e_payload >>= fun (ip, ip_payload) ->
+    let open Ipv4_packet in
+    Unmarshal.of_cstruct e_payload >>= fun (ip, ip_payload) ->
     get_transport ip.proto ip_payload >>= fun transport ->
     Ok { ethernet = (e, e_payload); network = Ipv4 (ip, ip_payload); transport }
   | Ethif_wire.ARP ->
@@ -244,100 +84,23 @@ let decompose buf =
     | Result.Ok a ->
       Ok { ethernet = (e, e_payload); network = (Arp a); transport = None; }
 
+let masquerade_dns from_us (ipv4_header : Ipv4_packet.t) (tcp_header : Tcp.Tcp_packet.t) =
+  let open Tcp.Tcp_packet in
+  match (from_us, tcp_header.src_port) with
+  | true, 53 -> begin
+    (* TCP on port 53 means we should take some DNS-related action. *)
+    (* first, re-read our DNS sources (usually /etc/resolv.conf) *)
+    Dns_resolver_unix.create () >>= function
+      | { Dns_resolver_unix.servers = (Ipaddr.V4 ip, port) :: _; _ } -> Lwt.return (ip, port)
+      | _ -> Log.err (fun f -> f "Failed to discover DNS server: assuming 127.0.0.1/53");
+                       Lwt.return (Ipaddr.V4.localhost, 53)
+  end
+  | true, p -> Lwt.return (Ipaddr.V4.localhost, tcp_header.src_port)
+  | false, _ -> Lwt.return Ipv4_packet.(ipv4_header.src, tcp_header.src_port)
 
 module Make(Vmnet: Sig.VMNET)(Resolv_conv: Sig.RESOLV_CONF) = struct
   module Tcpip_stack = Tcpip_stack.Make(Vmnet)
   module Dns_forward = Dns_forward.Make(Tcpip_stack.IPV4)(Tcpip_stack.UDPV4)(Resolv_conv)
-
-  (* we expect this to be listening on the vmnet side. *)
-  (* depending on the contents of the message, we'll do one of the following:
-     1) do nothing with the message (* NB this is not necessarily drop - another listener may take it *)
-        this is the case with all messages that are not IPv4/UDP, so IPv6 or TCP
-        messages must be going through a different channel
-     2) return an ICMP would-fragment message
-     3) construct a corresponding message and send it out the socket stack
-        (which may have rewritten headers to make it go to localhost)
-     Yeah, OK, so the tcp/udp listeners registered to the stack `s` are also built
-     on top of this; whatever doesn't get intercepted by this listen will be sent
-     to them.  Ouch.
-  *)
-
-  type writeback = Tcpip_stack.buffer -> unit Lwt.t
-
-  type socket_record = {
-    src : (Ipaddr.V4.t * int);
-    dst : (Ipaddr.V4.t * int);
-    payload : Cstruct.t;
-  }
-
-  type response = | Ignore of string
-                  | Would_fragment of (Ipaddr.V4.t * Cstruct.t) (* dst and icmp packet *)
-                  | Socket of (writeback * socket_record)
-
-  let should_forward_from_private local_ip u buf =
-    let open Rresult in
-    let cant_fragment ethernet_payload =
-      let flags_fragment_offset = Ipv4_wire.get_ipv4_off ethernet_payload in
-      ((flags_fragment_offset lsr 8) land 0x40) <> 0
-    in
-    let will_fragment ethernet_payload =
-      Cstruct.len ethernet_payload > mtu
-    in
-    let icmp_unreachable e = cant_fragment e && will_fragment e in
-    decompose buf >>= fun {ethernet; network; transport} ->
-    match network, transport with
-    | Arp _, _ | Ipv6 _, _ -> Result.Ok (Ignore "not ipv4")
-    | Ipv4 (ipv4_header, ipv4_payload), Some (Udp (udp_header, udp_payload)) ->
-      let for_us = Ipaddr.V4.compare ipv4_header.dst local_ip == 0 in
-      if icmp_unreachable (snd ethernet) then begin
-        let would_fragment =
-          let open Icmpv4_packet in
-          { code = Icmpv4_wire.(unreachable_reason_to_int Would_fragment);
-            ty   = Icmpv4_wire.Destination_unreachable;
-            subheader = Next_hop_mtu mtu }
-        in
-        Log.err (fun f -> f
-                    "Sending icmp-dst-unreachable in response to UDP %a:%d -> %a:%d with DNF set IPv4 len %d"
-                    Ipaddr.V4.pp_hum ipv4_header.src udp_header.src_port
-                    Ipaddr.V4.pp_hum ipv4_header.dst udp_header.dst_port
-                    (Cstruct.len (snd ethernet)));
-        Result.Ok (Would_fragment (ipv4_header.src, 
-                                   Icmpv4_packet.Marshal.make_cstruct ~payload:ipv4_payload
-                                     would_fragment))
-        (* TODO: I think this block isn't necessary if we set up the DNS
-           listener to restrict traffic to that which is intended for it *)
-      end else if (not for_us) then begin
-        (* We handle DNS on port 53 ourselves, but if it's going to an external IP
-           then we treat it like all other UDP and NAT it *)
-        Log.debug (fun f -> f "UDP %a:%d -> %a:%d len %d"
-                    Ipaddr.V4.pp_hum ipv4_header.src udp_header.src_port
-                    Ipaddr.V4.pp_hum ipv4_header.dst udp_header.dst_port
-                    (Cstruct.len (snd ethernet)));
-        let reply = fun buf -> Tcpip_stack.UDPV4.writev
-            ~source_ip:ipv4_header.dst ~source_port:udp_header.dst_port
-            ~dest_ip:ipv4_header.src ~dest_port:udp_header.src_port u [ buf ] in
-        let reply_record = {
-          src=(ipv4_header.src, udp_header.src_port); dst=(ipv4_header.dst,
-                                                           udp_header.dst_port); payload=udp_payload; } in
-        Result.Ok (Socket (reply, reply_record))
-      end else if for_us && udp_header.dst_port == 123 then begin
-        (* port 123 is special -- proxy these requests to our localhost address for the local OSX ntp
-           listener to respond to *)
-        let localhost = Ipaddr.V4.localhost in
-        Log.debug (fun f -> f "UDP/123 request from port %d -- sending it to %a:%d"
-                      udp_header.src_port Ipaddr.V4.pp_hum localhost udp_header.dst_port);
-        let reply buf = Tcpip_stack.UDPV4.writev ~source_ip:local_ip
-            ~source_port:udp_header.dst_port ~dest_ip:ipv4_header.src
-            ~dest_port:udp_header.src_port u [ buf ] in
-        let reply_record = { src=(localhost, udp_header.src_port);
-                             dst=(localhost, udp_header.dst_port); payload = udp_payload}
-        in
-        Result.Ok (Socket (reply, reply_record))
-      end
-      else
-        (* this particular function doesn't need to do a transformation *)
-        Result.Ok (Ignore "ipv4 and udp, but no transformation or further match needed")
-    | Ipv4 _, _ -> Result.Ok (Ignore "ipv4, but not udp")
 
   let connect x peer_ip local_ip =
     let config = Tcpip_stack.make ~client_macaddr ~server_macaddr ~peer_ip ~local_ip in
@@ -345,79 +108,117 @@ module Make(Vmnet: Sig.VMNET)(Resolv_conv: Sig.RESOLV_CONF) = struct
       >>= function
       | `Error (`Msg m) -> failwith m
       | `Ok s ->
-        let (ip, udp) = Tcpip_stack.ipv4 s, Tcpip_stack.udpv4 s in
-        Tcpip_stack.listen_udpv4 s ~port:53 (Dns_forward.input ~ip ~udp);
+        let (arp, ip, icmp, udp, tcp) = Tcpip_stack.(arpv4 s, ipv4 s, icmpv4 s, udpv4 s, tcpv4 s) in
         Vmnet.add_listener x (fun buf ->
-            match should_forward_from_private local_ip udp buf with
-            | Result.Error s ->
-              Log.debug (fun f -> f "vmnet listener had an error %s parsing packet %a -- the traffic will be dropped"
-                            s Cstruct.hexdump_pp buf);
+            match decompose buf with
+            | Result.Error s -> Log.debug
+                                (fun f -> f
+                                 "could not parse a packet from vmnet listener (%s), dropping it: %a"
+                                s Cstruct.hexdump_pp buf);
               Lwt.return_unit
-            | Result.Ok (Ignore s) ->
-              Log.debug (fun f -> f "vmnet listener is not acting on packet because %s" s);
-              Lwt.return_unit
-            | Result.Ok (Would_fragment (dst, payload)) ->
-              let (f, len) = Tcpip_stack.IPV4.allocate ip ~src:local_ip ~dst ~proto:`ICMP in
-              Cstruct.blit payload 0 f len (Cstruct.len payload);
-              Tcpip_stack.IPV4.writev ip f [Cstruct.shift f len]
-            | Result.Ok (Socket (reply, {src; dst; payload})) ->
-              Socket.Datagram.input ~reply ~src ~dst ~payload
-          );
-        Tcpip_stack.listen_tcpv4_flow s ~on_flow_arrival:(
-          fun ~src:(src_ip, src_port) ~dst:(dst_ip, dst_port) ->
-            let description =
-              Printf.sprintf "TCP %s:%d > %s:%d"
-                (Ipaddr.V4.to_string src_ip) src_port
-                (Ipaddr.V4.to_string dst_ip) dst_port in
-            Log.debug (fun f -> f "%s connecting" description);
-            let for_us = Ipaddr.V4.compare src_ip local_ip == 0 in
-            ( if for_us && src_port = 53 then begin
-                  Dns_resolver_unix.create () (* re-read /etc/resolv.conf *)
-                  >>= function
-                  | { Dns_resolver_unix.servers = (Ipaddr.V4 ip, port) :: _; _ } -> Lwt.return (ip, port)
-                  | _ ->
-                    Log.err (fun f -> f "Failed to discover DNS server: assuming 127.0.01");
-                    Lwt.return (Ipaddr.V4.of_string_exn "127.0.0.1", 53)
-                end else Lwt.return (src_ip, src_port)
-            ) >>= fun (src_ip, src_port) ->
-            (* If the traffic is for us, use a local IP address that is really
-               ours, rather than send traffic off to someone else (!) *)
-            let src_ip = if for_us then Ipaddr.V4.localhost else src_ip in
-            Socket.Stream.connect_v4 src_ip src_port
-            >>= function
-            | `Error (`Msg m) ->
-              Log.info (fun f -> f "%s rejected: %s" description m);
-              return `Reject
-            | `Ok remote ->
-              Lwt.return (`Accept (fun local ->
-                  finally (fun () ->
-                      (* proxy between local and remote *)
-                      Log.debug (fun f -> f "%s connected" description);
-                      Mirage_flow.proxy (module Clock) (module Tcpip_stack.TCPV4_half_close) local (module Socket.Stream) remote ()
-                      >>= function
-                      | `Error (`Msg m) ->
-                        Log.err (fun f -> f "%s proxy failed with %s" description m);
-                        return ()
-                      | `Ok (l_stats, r_stats) ->
-                        Log.debug (fun f ->
-                            f "%s closing: l2r = %s; r2l = %s" description
-                              (Mirage_flow.CopyStats.to_string l_stats) (Mirage_flow.CopyStats.to_string r_stats)
-                          );
-                        return ()
-                    ) (fun () ->
-                      Socket.Stream.close remote
-                      >>= fun () ->
-                      Log.debug (fun f -> f "%s Socket.Stream.close" description);
-                      Lwt.return ()
-                    )
-                ))
-        );
-        Tcpip_stack.listen s
-        >>= fun () ->
-        Log.info (fun f -> f "TCP/IP ready");
+            | Result.Ok {ethernet; network; transport} ->
+            match network, transport with
+            | Ipv6 _, _ -> (* TODO: we could attempt to do something brighter here *)
+              Log.debug (fun f -> f "Dropping ipv6 packet"); Lwt.return_unit
+            | Arp a, _  -> (* ARP packets are either for us or shouldn't be
+                              forwarded, so send them to our processor for
+                              further consideration *)
+              Tcpip_stack.ARPV4.input arp (snd ethernet)
+            | Ipv4 (ipv4_header, ipv4_payload), Some (Udp (udp_header, udp_payload)) -> (
+              let open Udp_packet in
+              let open Ipv4_packet in
+              let for_us = Ipaddr.V4.compare ipv4_header.dst local_ip == 0 in
+              (* most UDP packets will get forwarded to the socket stack,
+                 but there are exceptions for those which have our local_ip
+                 set as the destination.  Currently we handle ports 53 and 123
+                 ourselves. *)
+              let pp_details fmt (ipv4_header, udp_header) =
+                Format.fprintf fmt "UDP %a:%d -> %a -> %d"
+                  Ipaddr.V4.pp_hum ipv4_header.src udp_header.src_port
+                  Ipaddr.V4.pp_hum ipv4_header.dst udp_header.dst_port
+              in
+              match for_us, udp_header.dst_port with
+              | true, 53 ->
+                (* DNS packets bound for us should be relayed to our special proxy,
+                   which will either answer them directly or send them to our nameservers *)
+                Log.debug (fun f -> f "answering DNS query: %a len %d"
+                              pp_details (ipv4_header, udp_header)
+                              (Cstruct.len (snd ethernet)));
+                Dns_forward.input ~ip ~udp ~src:ipv4_header.src
+                  ~dst:ipv4_header.dst ~src_port:udp_header.src_port buf
+              | true, 123 ->
+                (* NTP packets bound for us should be rewritten as queries to localhost,
+                   and sent out the socket stack. *)
+                Log.debug (fun f -> f "forwarding NTP query to localhost: %a len %d"
+				pp_details (ipv4_header, udp_header) (Cstruct.len (snd ethernet)));
+                let reply buf = Tcpip_stack.UDPV4.writev ~src:local_ip
+                    ~src_port:udp_header.dst_port ~dst:ipv4_header.src
+                    ~dst_port:udp_header.src_port udp [ buf ] in
+		let localhost = Ipaddr.V4.localhost in
+                Socket.Datagram.input ~reply ~src:(localhost, udp_header.src_port)
+                  ~dst:(localhost, udp_header.dst_port) ~payload:udp_payload
+              | true, _ ->
+                Log.debug (fun f -> f "UDP packet for us on a port where we're not listening: %a len %d"
+                              pp_details (ipv4_header, udp_header) (Cstruct.len (snd ethernet)));
+                (* TODO: send an ICMP message to indicate the port's closed *)
+                Lwt.return_unit
+              | false, _ ->
+                (* send this UDP packet to the socket stack for relay to the broader world *)
+                let reply buf = Tcpip_stack.UDPV4.writev ~src:local_ip
+                    ~src_port:udp_header.dst_port ~dst:ipv4_header.src
+                    ~dst_port:udp_header.src_port udp [ buf ] in
+                Socket.Datagram.input ~reply ~src:(ipv4_header.src, udp_header.src_port)
+                  ~dst:(ipv4_header.dst, udp_header.dst_port) ~payload:udp_payload
+            )
+            | Ipv4 (ipv4_header, ipv4_payload), Some (Tcp ((tcp_header : Tcp.Tcp_packet.t), tcp_payload)) ->
+                let open Ipv4_packet in
+                let open Tcp.Tcp_packet in
+                let from_us = Ipaddr.V4.compare ipv4_header.src local_ip == 0 in
+                let pp_details fmt (ipv4_header, tcp_header) =
+                  Format.fprintf fmt "TCP %a:%d -> %a -> %d"
+                  Ipaddr.V4.pp_hum ipv4_header.src tcp_header.src_port
+                  Ipaddr.V4.pp_hum ipv4_header.dst tcp_header.dst_port
+                in
+                masquerade_dns from_us ipv4_header tcp_header >>= fun (ip, port) ->
+                Socket.Stream.connect_v4 ip port >>= function
+                | `Error (`Msg m) ->
+                   Log.info (fun f -> f "%a/%d rejected: %s" Ipaddr.V4.pp_hum ip port m);
+                   Lwt.return_unit
+                   (* TODO: send rejection message *)
+                | `Ok remote ->
+                   Lwt.return (fun local ->
+                   (* let's do some proxying! *) 
+                   finally (fun () ->
+                     (* proxy between local and remote *)
+                     Log.debug (fun f -> f "%a connected" pp_details (ipv4_header, tcp_header));
+                     (* So we need something that represents the local end.  Since we're basically implementing NAT, this is our pull into the hashtable or whatever exists for this module. *)
+(* In current master, we return something that accepts (`Accept (fun local -> blah )), so it's not our problem -- we hand it off to someone else. *)
+(* but we've altered the control flow here, so now we're somehow not passing this value to something that wants to feed it a local flow; instead we're passing it to something (that something being add_listener_ that expects to take some infrmation and finish with unit. *)
+(* this is because on_flow_arrival took an `Accept or `Reject and a flow -> unit, I assume? *)
+(* yes, that's it.  input_flow's on_flow_arrival gets plumbed through the rest of pcb.ml .  We want to remove this requirement, since we should be able to state the logic ourselves (or at least do our own tcp implementation which doesn't need a fork!) *)
+(* so we need an initialization on this flow.   we should only reach this code path if the thing is new, so we only need to worry about the initial thing.  what's the normal connection establishment API for FLOW?  oh hm, it's not expressed in V1.FLOW; we must get it from the type equivalence in TCP where we know that TCP.t is flow.*)
+(* can we just call `input` with a listeners function that always returns `some fun local -> blah`? *)
+                     Mirage_flow.proxy (module Clock) (module Tcpip_stack.TCPV4_half_close) local (module Socket.Stream) remote ()
+                     >>= function
+                     | `Error (`Msg m) ->
+Log.err (fun f -> f "%a proxy failed with %s" pp_details (ipv4_header, tcp_header) m);
+                       Lwt.return_unit
+                     | `Ok (l_stats, r_stats) ->
+                       Log.debug (fun f ->
+                           f "%a closing: l2r = %s; r2l = %s" pp_details (ipv4_header, tcp_header)
+                             (Mirage_flow.CopyStats.to_string l_stats) (Mirage_flow.CopyStats.to_string r_stats)
+                         );
+                       Lwt.return_unit
+                   ) (fun () ->
+                     Socket.Stream.close remote
+                     >>= fun () ->
+                     Log.debug (fun f -> f "%a Socket.Stream.close" pp_details (ipv4_header, tcp_header));
+                       Lwt.return_unit
+		     )
+		   )
+	);
         Lwt.return ()
     end
->>>>>>> WIP - pull routing logic out of slirp main, use result types rather than
 
   type config = {
     peer_ip: Ipaddr.V4.t;

@@ -112,8 +112,7 @@ let input ~ip ~udp ~src ~dst ~src_port buf =
     let reply buffer =
       Log.debug (fun f -> f "DNS[%s] %s:%d <- %s %s" (tidstr_of_dns dns) src_str src_port dst_str (string_of_dns (parse_dns buffer)));
       remove_tid dns;
-      Udp.write ~source_port:53 ~dest_ip:src ~dest_port:src_port udp buffer in
-
+      Udp.write ~src_port:53 ~dst:src ~dst_port:src_port udp buffer in
     Socket.Datagram.input ~reply ~src:(Ipaddr.V4 src, src_port) ~dst:(dst, dst_port) ~payload:buf
   | None ->
     Log.err (fun f -> f "DNS[%s] No upstream DNS server configured: dropping request" (tidstr_of_dns dns));

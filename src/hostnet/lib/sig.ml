@@ -164,6 +164,10 @@ module type TCPIP = sig
     with type ipaddr = Ipaddr.V4.t
      and type 'a io  = 'a Lwt.t
 
+  module ARPV4 : V1_LWT.ARP
+    with type ipaddr = Ipaddr.V4.t
+     and type 'a io = 'a Lwt.t
+
   include V1_LWT.STACKV4
     with type IPV4.prefix = Ipaddr.V4.t
      and type IPV4.uipaddr = Ipaddr.t
