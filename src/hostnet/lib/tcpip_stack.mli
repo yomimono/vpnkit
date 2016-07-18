@@ -9,4 +9,7 @@ val make: client_macaddr:Macaddr.t -> server_macaddr:Macaddr.t
 val connect:
   config:configuration -> Vmnet.t
   -> [ `Ok of t | `Error of [ `Msg of string ] ] Lwt.t
+
+val icmpv4 : t -> ICMPV4.t
+
 end

@@ -38,6 +38,7 @@ let print_pcap = function
   | Some (file, None) -> "capturing to " ^ file ^ " with no limit"
   | Some (file, Some limit) -> "capturing to " ^ file ^ " but limited to " ^ (Int64.to_string limit)
 
+<<<<<<< HEAD
 module Make(Config: Active_config.S)(Vmnet: Sig.VMNET)(Resolv_conf: Sig.RESOLV_CONF)(Host: Sig.HOST) = struct
   module Tcpip_stack = Tcpip_stack.Make(Vmnet)(Host.Time)
   module Dns_forward = Dns_forward.Make(Tcpip_stack.IPV4)(Tcpip_stack.UDPV4)(Resolv_conf)(Host.Sockets)(Host.Time)
@@ -198,6 +199,225 @@ let connect x peer_ip local_ip =
             Log.info (fun f -> f "TCP/IP ready");
             Lwt.return { after_disconnect = Vmnet.after_disconnect x }
         end
+=======
+type transport = | Tcp of (Tcp.Tcp_packet.t * Cstruct.t)
+                 | Udp of (Udp_packet.t * Cstruct.t)
+                 | Icmp of (Icmpv4_packet.t * Cstruct.t)
+
+type network = | Ipv4 of (Ipv4_packet.t * Cstruct.t)
+               | Ipv6 of (Cstruct.t * Cstruct.t)
+               | Arp of Arpv4_packet.t
+
+type decomposed =
+  { ethernet : Ethif_packet.t * Cstruct.t;
+    network : network;
+    transport : transport option;
+  }
+
+let decompose buf =
+  let open Rresult in
+  let get_transport proto buf =
+    match Ipv4_packet.Unmarshal.int_to_protocol proto with
+    | None -> Result.Ok None
+    | Some `ICMP ->
+      Icmpv4_packet.Unmarshal.of_cstruct buf >>= fun icmp -> Result.Ok (Some (Icmp icmp))
+    | Some `TCP ->
+      Tcp.Tcp_packet.Unmarshal.of_cstruct buf >>= fun tcp -> Result.Ok (Some (Tcp tcp))
+    | Some `UDP ->
+      Udp_packet.Unmarshal.of_cstruct buf >>= fun udp -> Result.Ok (Some (Udp udp))
+  in
+  Ethif_packet.Unmarshal.of_cstruct buf >>= fun (e, e_payload) ->
+  match e.ethertype with
+  | Ethif_wire.IPv6 ->
+    let header = Cstruct.sub e_payload 0 Ipv6_wire.sizeof_ipv6 in
+    let payload = Cstruct.shift e_payload Ipv6_wire.sizeof_ipv6 in
+    get_transport (Ipv6_wire.get_ipv6_nhdr header) payload >>= fun transport ->
+    Ok { ethernet = (e, e_payload) ; network = Ipv6 (header, payload);
+         transport}
+  | Ethif_wire.IPv4 ->
+    Ipv4_packet.Unmarshal.of_cstruct e_payload >>= fun (ip, ip_payload) ->
+    get_transport ip.proto ip_payload >>= fun transport ->
+    Ok { ethernet = (e, e_payload); network = Ipv4 (ip, ip_payload); transport }
+  | Ethif_wire.ARP ->
+    match Arpv4_packet.Unmarshal.of_cstruct e_payload with
+    | Result.Error e -> Result.Error (Arpv4_packet.Unmarshal.string_of_error e)
+    | Result.Ok a ->
+      Ok { ethernet = (e, e_payload); network = (Arp a); transport = None; }
+
+
+module Make(Vmnet: Sig.VMNET)(Resolv_conv: Sig.RESOLV_CONF) = struct
+  module Tcpip_stack = Tcpip_stack.Make(Vmnet)
+  module Dns_forward = Dns_forward.Make(Tcpip_stack.IPV4)(Tcpip_stack.UDPV4)(Resolv_conv)
+
+  (* we expect this to be listening on the vmnet side. *)
+  (* depending on the contents of the message, we'll do one of the following:
+     1) do nothing with the message (* NB this is not necessarily drop - another listener may take it *)
+        this is the case with all messages that are not IPv4/UDP, so IPv6 or TCP
+        messages must be going through a different channel
+     2) return an ICMP would-fragment message
+     3) construct a corresponding message and send it out the socket stack
+        (which may have rewritten headers to make it go to localhost)
+     Yeah, OK, so the tcp/udp listeners registered to the stack `s` are also built
+     on top of this; whatever doesn't get intercepted by this listen will be sent
+     to them.  Ouch.
+  *)
+
+  type writeback = Tcpip_stack.buffer -> unit Lwt.t
+
+  type socket_record = {
+    src : (Ipaddr.V4.t * int);
+    dst : (Ipaddr.V4.t * int);
+    payload : Cstruct.t;
+  }
+
+  type response = | Ignore of string
+                  | Would_fragment of (Ipaddr.V4.t * Cstruct.t) (* dst and icmp packet *)
+                  | Socket of (writeback * socket_record)
+
+  let should_forward_from_private local_ip u buf =
+    let open Rresult in
+    let cant_fragment ethernet_payload =
+      let flags_fragment_offset = Ipv4_wire.get_ipv4_off ethernet_payload in
+      ((flags_fragment_offset lsr 8) land 0x40) <> 0
+    in
+    let will_fragment ethernet_payload =
+      Cstruct.len ethernet_payload > mtu
+    in
+    let icmp_unreachable e = cant_fragment e && will_fragment e in
+    decompose buf >>= fun {ethernet; network; transport} ->
+    match network, transport with
+    | Arp _, _ | Ipv6 _, _ -> Result.Ok (Ignore "not ipv4")
+    | Ipv4 (ipv4_header, ipv4_payload), Some (Udp (udp_header, udp_payload)) ->
+      let for_us = Ipaddr.V4.compare ipv4_header.dst local_ip == 0 in
+      if icmp_unreachable (snd ethernet) then begin
+        let would_fragment =
+          let open Icmpv4_packet in
+          { code = Icmpv4_wire.(unreachable_reason_to_int Would_fragment);
+            ty   = Icmpv4_wire.Destination_unreachable;
+            subheader = Next_hop_mtu mtu }
+        in
+        Log.err (fun f -> f
+                    "Sending icmp-dst-unreachable in response to UDP %a:%d -> %a:%d with DNF set IPv4 len %d"
+                    Ipaddr.V4.pp_hum ipv4_header.src udp_header.src_port
+                    Ipaddr.V4.pp_hum ipv4_header.dst udp_header.dst_port
+                    (Cstruct.len (snd ethernet)));
+        Result.Ok (Would_fragment (ipv4_header.src, 
+                                   Icmpv4_packet.Marshal.make_cstruct ~payload:ipv4_payload
+                                     would_fragment))
+        (* TODO: I think this block isn't necessary if we set up the DNS
+           listener to restrict traffic to that which is intended for it *)
+      end else if (not for_us) then begin
+        (* We handle DNS on port 53 ourselves, but if it's going to an external IP
+           then we treat it like all other UDP and NAT it *)
+        Log.debug (fun f -> f "UDP %a:%d -> %a:%d len %d"
+                    Ipaddr.V4.pp_hum ipv4_header.src udp_header.src_port
+                    Ipaddr.V4.pp_hum ipv4_header.dst udp_header.dst_port
+                    (Cstruct.len (snd ethernet)));
+        let reply = fun buf -> Tcpip_stack.UDPV4.writev
+            ~source_ip:ipv4_header.dst ~source_port:udp_header.dst_port
+            ~dest_ip:ipv4_header.src ~dest_port:udp_header.src_port u [ buf ] in
+        let reply_record = {
+          src=(ipv4_header.src, udp_header.src_port); dst=(ipv4_header.dst,
+                                                           udp_header.dst_port); payload=udp_payload; } in
+        Result.Ok (Socket (reply, reply_record))
+      end else if for_us && udp_header.dst_port == 123 then begin
+        (* port 123 is special -- proxy these requests to our localhost address for the local OSX ntp
+           listener to respond to *)
+        let localhost = Ipaddr.V4.localhost in
+        Log.debug (fun f -> f "UDP/123 request from port %d -- sending it to %a:%d"
+                      udp_header.src_port Ipaddr.V4.pp_hum localhost udp_header.dst_port);
+        let reply buf = Tcpip_stack.UDPV4.writev ~source_ip:local_ip
+            ~source_port:udp_header.dst_port ~dest_ip:ipv4_header.src
+            ~dest_port:udp_header.src_port u [ buf ] in
+        let reply_record = { src=(localhost, udp_header.src_port);
+                             dst=(localhost, udp_header.dst_port); payload = udp_payload}
+        in
+        Result.Ok (Socket (reply, reply_record))
+      end
+      else
+        (* this particular function doesn't need to do a transformation *)
+        Result.Ok (Ignore "ipv4 and udp, but no transformation or further match needed")
+    | Ipv4 _, _ -> Result.Ok (Ignore "ipv4, but not udp")
+
+  let connect x peer_ip local_ip =
+    let config = Tcpip_stack.make ~client_macaddr ~server_macaddr ~peer_ip ~local_ip in
+    begin Tcpip_stack.connect ~config x
+      >>= function
+      | `Error (`Msg m) -> failwith m
+      | `Ok s ->
+        let (ip, udp) = Tcpip_stack.ipv4 s, Tcpip_stack.udpv4 s in
+        Tcpip_stack.listen_udpv4 s ~port:53 (Dns_forward.input ~ip ~udp);
+        Vmnet.add_listener x (fun buf ->
+            match should_forward_from_private local_ip udp buf with
+            | Result.Error s ->
+              Log.debug (fun f -> f "vmnet listener had an error %s parsing packet %a -- the traffic will be dropped"
+                            s Cstruct.hexdump_pp buf);
+              Lwt.return_unit
+            | Result.Ok (Ignore s) ->
+              Log.debug (fun f -> f "vmnet listener is not acting on packet because %s" s);
+              Lwt.return_unit
+            | Result.Ok (Would_fragment (dst, payload)) ->
+              let (f, len) = Tcpip_stack.IPV4.allocate ip ~src:local_ip ~dst ~proto:`ICMP in
+              Cstruct.blit payload 0 f len (Cstruct.len payload);
+              Tcpip_stack.IPV4.writev ip f [Cstruct.shift f len]
+            | Result.Ok (Socket (reply, {src; dst; payload})) ->
+              Socket.Datagram.input ~reply ~src ~dst ~payload
+          );
+        Tcpip_stack.listen_tcpv4_flow s ~on_flow_arrival:(
+          fun ~src:(src_ip, src_port) ~dst:(dst_ip, dst_port) ->
+            let description =
+              Printf.sprintf "TCP %s:%d > %s:%d"
+                (Ipaddr.V4.to_string src_ip) src_port
+                (Ipaddr.V4.to_string dst_ip) dst_port in
+            Log.debug (fun f -> f "%s connecting" description);
+            let for_us = Ipaddr.V4.compare src_ip local_ip == 0 in
+            ( if for_us && src_port = 53 then begin
+                  Dns_resolver_unix.create () (* re-read /etc/resolv.conf *)
+                  >>= function
+                  | { Dns_resolver_unix.servers = (Ipaddr.V4 ip, port) :: _; _ } -> Lwt.return (ip, port)
+                  | _ ->
+                    Log.err (fun f -> f "Failed to discover DNS server: assuming 127.0.01");
+                    Lwt.return (Ipaddr.V4.of_string_exn "127.0.0.1", 53)
+                end else Lwt.return (src_ip, src_port)
+            ) >>= fun (src_ip, src_port) ->
+            (* If the traffic is for us, use a local IP address that is really
+               ours, rather than send traffic off to someone else (!) *)
+            let src_ip = if for_us then Ipaddr.V4.localhost else src_ip in
+            Socket.Stream.connect_v4 src_ip src_port
+            >>= function
+            | `Error (`Msg m) ->
+              Log.info (fun f -> f "%s rejected: %s" description m);
+              return `Reject
+            | `Ok remote ->
+              Lwt.return (`Accept (fun local ->
+                  finally (fun () ->
+                      (* proxy between local and remote *)
+                      Log.debug (fun f -> f "%s connected" description);
+                      Mirage_flow.proxy (module Clock) (module Tcpip_stack.TCPV4_half_close) local (module Socket.Stream) remote ()
+                      >>= function
+                      | `Error (`Msg m) ->
+                        Log.err (fun f -> f "%s proxy failed with %s" description m);
+                        return ()
+                      | `Ok (l_stats, r_stats) ->
+                        Log.debug (fun f ->
+                            f "%s closing: l2r = %s; r2l = %s" description
+                              (Mirage_flow.CopyStats.to_string l_stats) (Mirage_flow.CopyStats.to_string r_stats)
+                          );
+                        return ()
+                    ) (fun () ->
+                      Socket.Stream.close remote
+                      >>= fun () ->
+                      Log.debug (fun f -> f "%s Socket.Stream.close" description);
+                      Lwt.return ()
+                    )
+                ))
+        );
+        Tcpip_stack.listen s
+        >>= fun () ->
+        Log.info (fun f -> f "TCP/IP ready");
+        Lwt.return ()
+    end
+>>>>>>> WIP - pull routing logic out of slirp main, use result types rather than
 
   type config = {
     peer_ip: Ipaddr.V4.t;
@@ -215,19 +435,19 @@ let connect x peer_ip local_ip =
       | None -> Lwt.return None
       | Some x ->
         begin match Stringext.split (String.trim x) ~on:':' with
-        | [ filename ] ->
-          (* Assume 10MiB limit for safety *)
-          Lwt.return (Some (filename, Some 16777216L))
-        | [ filename; limit ] ->
-          let limit =
-            try
-              Int64.of_string limit
-            with
-            | _ -> 16777216L in
-          let limit = if limit = 0L then None else Some limit in
-          Lwt.return (Some (filename, limit))
-        | _ ->
-          Lwt.return None
+          | [ filename ] ->
+            (* Assume 10MiB limit for safety *)
+            Lwt.return (Some (filename, Some 16777216L))
+          | [ filename; limit ] ->
+            let limit =
+              try
+                Int64.of_string limit
+              with
+              | _ -> 16777216L in
+            let limit = if limit = 0L then None else Some limit in
+            Lwt.return (Some (filename, limit))
+          | _ ->
+            Lwt.return None
         end in
     Active_config.map parse_pcap string_pcap_settings
     >>= fun pcap_settings ->
@@ -240,13 +460,13 @@ let connect x peer_ip local_ip =
       | Some x ->
         let strings = List.map String.trim @@ Stringext.split x ~on:',' in
         let ip_opts = List.map
-          (fun x ->
-            try
-              Some (Ipaddr.of_string_exn x)
-            with _ ->
-              Log.err (fun f -> f "Failed to parse IP address in allowed-bind-address: %s" x);
-              None
-          ) strings in
+            (fun x ->
+               try
+                 Some (Ipaddr.of_string_exn x)
+               with _ ->
+                 Log.err (fun f -> f "Failed to parse IP address in allowed-bind-address: %s" x);
+                 None
+            ) strings in
         let ips = List.fold_left (fun acc x -> match x with None -> acc | Some x -> x :: acc) [] ip_opts in
         Lwt.return (Some ips) in
     Active_config.map parse_bind_address string_allowed_bind_address
@@ -284,8 +504,8 @@ let connect x peer_ip local_ip =
     let local_ip = Active_config.hd host_ips in
 
     Log.info (fun f -> f "Creating slirp server pcap_settings:%s peer_ip:%s local_ip:%s"
-      (print_pcap @@ Active_config.hd pcap_settings) (Ipaddr.V4.to_string peer_ip) (Ipaddr.V4.to_string local_ip)
-    );
+                 (print_pcap @@ Active_config.hd pcap_settings) (Ipaddr.V4.to_string peer_ip) (Ipaddr.V4.to_string local_ip)
+             );
     let t = {
       peer_ip;
       local_ip;
@@ -295,29 +515,29 @@ let connect x peer_ip local_ip =
     Lwt.return t
 
   let connect t client =
-      Vmnet.of_fd ~client_macaddr ~server_macaddr client
-      >>= function
-      | `Error (`Msg m) -> failwith m
-      | `Ok x ->
-        Log.debug (fun f -> f "accepted vmnet connection");
+    Vmnet.of_fd ~client_macaddr ~server_macaddr client
+    >>= function
+    | `Error (`Msg m) -> failwith m
+    | `Ok x ->
+      Log.debug (fun f -> f "accepted vmnet connection");
 
-        let rec monitor_pcap_settings pcap_settings =
-          ( match Active_config.hd pcap_settings with
-            | None ->
-              Log.debug (fun f -> f "Disabling any active packet capture");
-              Vmnet.stop_capture x
-            | Some (filename, size_limit) ->
-              Log.debug (fun f -> f "Capturing packets to %s %s" filename (match size_limit with None -> "with no limit" | Some x -> Printf.sprintf "limited to %Ld bytes" x));
-              Vmnet.start_capture x ?size_limit filename )
-          >>= fun () ->
-          Active_config.tl pcap_settings
-          >>= fun pcap_settings ->
-          monitor_pcap_settings pcap_settings in
-        Lwt.async (fun () ->
+      let rec monitor_pcap_settings pcap_settings =
+        ( match Active_config.hd pcap_settings with
+          | None ->
+            Log.debug (fun f -> f "Disabling any active packet capture");
+            Vmnet.stop_capture x
+          | Some (filename, size_limit) ->
+            Log.debug (fun f -> f "Capturing packets to %s %s" filename (match size_limit with None -> "with no limit" | Some x -> Printf.sprintf "limited to %Ld bytes" x));
+            Vmnet.start_capture x ?size_limit filename )
+        >>= fun () ->
+        Active_config.tl pcap_settings
+        >>= fun pcap_settings ->
+        monitor_pcap_settings pcap_settings in
+      Lwt.async (fun () ->
           log_exception_continue "monitor_pcap_settings"
             (fun () ->
-              monitor_pcap_settings t.pcap_settings
+               monitor_pcap_settings t.pcap_settings
             )
-          );
-        connect x t.peer_ip t.local_ip
+        );
+      connect x t.peer_ip t.local_ip
 end

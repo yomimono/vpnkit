@@ -74,18 +74,17 @@ let make ~client_macaddr ~server_macaddr ~peer_ip ~local_ip =
 
 module Netif = Filter.Make(Vmnet)
 
-module Ethif1 = Ethif.Make(Netif)
+module DEVICE = Ethif.Make(Netif)
 
-module Arpv41 = Arp.Make(Ethif1)
+module ARPV4 = Arp.Make(DEVICE)
 
-module Ipv41 = Ipv4.Make(Ethif1)(Arpv41)
+module IPV4 = Ipv4.Make(DEVICE)(ARPV4)
 
-module Udp1 = Udp.Make(Ipv41)
+module ICMPV4 = Icmpv4.Make(IPV4)
 
-module Tcp1 = Tcp.Flow.Make(Ipv41)(Time)(Clock)(Random)
+module UDPV4 = Udp.Make(IPV4)
 
-include Tcpip_stack_direct.Make(Console_unix)(Time)
-    (Random)(Netif)(Ethif1)(Arpv41)(Ipv41)(Udp1)(Tcp1)
+module TCPV4 = Tcp.Flow.Make(IPV4)(OS.Time)(Clock)(Random)
 
 module Dhcp = struct
   let of_interest mac dest =

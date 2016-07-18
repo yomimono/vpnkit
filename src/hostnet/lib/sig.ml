@@ -160,6 +160,10 @@ end
 module type TCPIP = sig
   (** A TCP/IP stack *)
 
+  module ICMPV4 : V1_LWT.ICMPV4
+    with type ipaddr = Ipaddr.V4.t
+     and type 'a io  = 'a Lwt.t
+
   include V1_LWT.STACKV4
     with type IPV4.prefix = Ipaddr.V4.t
      and type IPV4.uipaddr = Ipaddr.t
